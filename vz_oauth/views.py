@@ -1,16 +1,47 @@
 # -*- coding: utf-8 -*
+from .models import Client
 from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login
 from django.contrib.auth.forms import AuthenticationForm
 from django.contrib.sites.models import get_current_site
-from django.http import HttpResponseBadRequest, HttpResponseRedirect
+from django.http import HttpResponseBadRequest, HttpResponseRedirect, \
+    HttpResponse
 from django.template.response import TemplateResponse
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
-from .models import Client
-import re
-import urlparse
+from vz_oauth.models.tokens import RequestToken, AccessToken
+import simplejson
 import time
-from vz_oauth.models.tokens import RequestToken
+import urlparse
+import datetime
+from django.utils.timezone import utc
+from django.conf import settings
+import hashlib
+
+def get_user_data(request):
+    at = request.GET.get('access_token', None)
+    if at is None:
+        return HttpResponseBadRequest('Missing access_token')
+    try:
+        access_token = AccessToken.objects.get(access_token=at)
+    except AccessToken.DoesNotExist:
+        return HttpResponseBadRequest('Wrong access_token')
+    
+    if access_token.created + datetime.timedelta(seconds=access_token.expires_in) < datetime.datetime.utcnow().replace(tzinfo=utc):
+        return HttpResponseBadRequest('Access_token expired')
+    
+    user = access_token.user
+    content = {
+               'username': user.username,
+               'first_name': user.first_name,
+               'last_name': user.last_name,
+               }
+    try:
+        profile = user.get_profile()
+        content['phone'] = profile.phone
+    except Exception as e:
+        print e
+    content = simplejson.dumps(content)
+    return HttpResponse(content, mimetype='application/javascript')
 
 @never_cache
 def get_access_token(request):
@@ -41,8 +72,45 @@ def get_access_token(request):
     if not client.valid_redirect_uri(redirect_uri):
         return HttpResponseBadRequest('Wrong redirect_uri')
     
-    # создаем AccessToken
+    try:
+        request_token = RequestToken.objects.get(request_token=code)
+    except RequestToken.DoesNotExist:
+        return HttpResponseBadRequest('Wrong code')
     
+    if request_token.used:
+        return HttpResponseBadRequest('Token is used')
+    
+    if client != request_token.client:
+        return HttpResponseBadRequest('Client mismatch')
+    
+    request_token.used = True
+    request_token.save()
+    
+    # создаем AccessToken
+    access_token = _generate_access_token(request_token.user)
+    
+    content = {
+               'access_token': access_token.access_token,
+               'expires_in': access_token.expires_in
+               }
+    content = simplejson.dumps(content)
+    return HttpResponse(content, mimetype='application/javascript')
+
+def _generate_request_token(client, user):
+    key = hashlib.sha224(str(time.time()) + settings.SECRET_KEY).hexdigest()
+    request_token = RequestToken(request_token=key,
+                                 client=client,
+                                 user=user)
+    request_token.save()
+    return request_token
+
+def _generate_access_token(user):
+    key = hashlib.sha224(str(time.time()) + settings.SECRET_KEY).hexdigest()
+    access_token = AccessToken(access_token=key,
+                               expires_in=3600,
+                               user=user)
+    access_token.save()
+    return access_token
     
 
 @csrf_protect
@@ -61,13 +129,10 @@ def oauth_authorize(request):
     if not client.valid_redirect_uri(redirect_uri):
         return HttpResponseBadRequest('Wrong redirect_uri')
     
-    if request.user is not None:
+    if request.user.id:
         redirect_to = urlparse.urlparse(redirect_uri)
         # создаем RequestToken
-        request_token = RequestToken(request_token=str(time.time()),
-                                     client=client,
-                                     user=request.user)
-        request_token.save()
+        request_token = _generate_request_token(client, request.user)
 
         return HttpResponseRedirect('%s://%s%s?code=%s' % (redirect_to.scheme,
                                                    redirect_to.netloc,
@@ -85,9 +150,7 @@ def oauth_authorize(request):
                 request.session.delete_test_cookie()
                 
             # создаем RequestToken
-            request_token = RequestToken(request_token=str(time.time()),
-                                         client=client)
-            request_token.save()
+            request_token = _generate_request_token(client, request.user)
 
             return HttpResponseRedirect('%s://%s%s?code=%s' % (redirect_to.scheme,
                                                        redirect_to.netloc,

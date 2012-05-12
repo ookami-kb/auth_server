@@ -18,6 +18,11 @@ def profile(request):
         form = ProfileForm(instance=profile, data=request.POST)
         if form.is_valid():
             form.save()
+            
+            if 'password1' in form.cleaned_data and form.cleaned_data['password1']:
+                request.user.set_password(form.cleaned_data['password1'])
+                request.user.save()
+            
             return HttpResponseRedirect('/')
     else:
         form = ProfileForm(instance=profile)

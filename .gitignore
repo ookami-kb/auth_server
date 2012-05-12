@@ -1,0 +1,5 @@
+*.pyc
+.settings
+db
+auth_server/settings.py
+auth_client
